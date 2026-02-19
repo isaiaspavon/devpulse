@@ -20,12 +20,37 @@ HEADERS = {
 
 def gh_get(url, params=None):
     while True:
-        r = requests.get(url, headers=HEADERS, params=params)
-        if r.status_code == 403 and "rate limit" in r.text.lower():
-            time.sleep(10)
+        try:
+            r = requests.get(url, headers=HEADERS, params=params, timeout=30)
+
+            # Handle rate limiting properly via headers
+            if r.status_code == 403 and "rate limit" in r.text.lower():
+                reset = r.headers.get("X-RateLimit-Reset")
+                if reset:
+                    wait_seconds = max(5, int(reset) - int(time.time()) + 2)
+                else:
+                    wait_seconds = 15
+                print(f"[rate-limit] Sleeping {wait_seconds}s then retrying...")
+                time.sleep(wait_seconds)
+                continue
+
+            # Transient GitHub/server issues
+            if r.status_code in (500, 502, 503, 504):
+                print(f"[github-{r.status_code}] transient error, retrying in 5s: {url}")
+                time.sleep(5)
+                continue
+
+            r.raise_for_status()
+            return r
+
+        except requests.exceptions.Timeout:
+            print(f"[timeout] retrying: {url}")
+            time.sleep(2)
             continue
-        r.raise_for_status()
-        return r
+        except requests.exceptions.ConnectionError:
+            print(f"[conn-error] retrying in 3s: {url}")
+            time.sleep(3)
+            continue
 
 def connect():
     return psycopg.connect(
@@ -40,21 +65,28 @@ def upsert_repo(cur, owner, name, default_branch):
     """, (owner, name, default_branch))
 
 def ingest_commits(cur, owner, repo, since_iso=None):
-    # list commits
     url = f"https://api.github.com/repos/{owner}/{repo}/commits"
     page = 1
     while True:
         params = {"per_page": 100, "page": page}
         if since_iso:
             params["since"] = since_iso
+
         data = gh_get(url, params=params).json()
+        print(f"[commits] {owner}/{repo} page={page} fetched={len(data)}")
+
         if not data:
             break
 
-        for c in data:
+        for i, c in enumerate(data, start=1):
             sha = c["sha"]
             commit_obj = c["commit"]
             message = commit_obj.get("message")
+            msg_low = (message or "").lower()
+            ai_assisted = any(k in msg_low for k in ["copilot", "chatgpt", "cursor", "generated", "ai", "llm"])
+            ai_confidence = 0.7 if ai_assisted else 0.0
+            ai_reason = "heuristic_keywords" if ai_assisted else None
+
             committed_at = dt.parse(commit_obj["committer"]["date"])
             author_login = c["author"]["login"] if c.get("author") else None
             author_name = commit_obj["author"].get("name")
@@ -82,6 +114,10 @@ def ingest_commits(cur, owner, repo, since_iso=None):
                 message=excluded.message
             """, (sha, owner, repo, author_login, author_name, committed_at,
                   additions, deletions, files_changed, message))
+
+            if i % 25 == 0:
+                print(f"  [commits] {owner}/{repo} page={page} processed={i}")
+
         page += 1
 
 def ingest_prs(cur, owner, repo, state="all"):
@@ -90,6 +126,8 @@ def ingest_prs(cur, owner, repo, state="all"):
     while True:
         params = {"per_page": 100, "page": page, "state": state}
         data = gh_get(url, params=params).json()
+        print(f"[prs] {owner}/{repo} page={page} fetched={len(data)}")
+
         if not data:
             break
 
@@ -129,8 +167,11 @@ def ingest_prs(cur, owner, repo, state="all"):
                   additions, deletions, changed_files))
 
             # reviews
-            reviews = gh_get(f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
-                             params={"per_page": 100}).json()
+            reviews = gh_get(
+                f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+                params={"per_page": 100}
+            ).json()
+
             for rv in reviews:
                 rv_id = rv["id"]
                 reviewer = rv["user"]["login"] if rv.get("user") else None
@@ -149,8 +190,11 @@ def ingest_prs(cur, owner, repo, state="all"):
                 """, (rv_id, owner, repo, pr_number, reviewer, state, submitted_at, body))
 
             # review comments
-            comments = gh_get(f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/comments",
-                              params={"per_page": 100}).json()
+            comments = gh_get(
+                f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/comments",
+                params={"per_page": 100}
+            ).json()
+
             for cm in comments:
                 cm_id = cm["id"]
                 commenter = cm["user"]["login"] if cm.get("user") else None
@@ -165,6 +209,7 @@ def ingest_prs(cur, owner, repo, state="all"):
                     created_at=excluded.created_at,
                     body=excluded.body
                 """, (cm_id, owner, repo, pr_number, commenter, created, body))
+
         page += 1
 
 def ingest_issues(cur, owner, repo):
@@ -173,8 +218,11 @@ def ingest_issues(cur, owner, repo):
     while True:
         params = {"per_page": 100, "page": page, "state": "all"}
         data = gh_get(url, params=params).json()
+        print(f"[issues] {owner}/{repo} page={page} fetched={len(data)}")
+
         if not data:
             break
+
         for iss in data:
             # GitHub "issues" includes PRs; skip PRs here
             if "pull_request" in iss:
@@ -199,16 +247,19 @@ def ingest_issues(cur, owner, repo):
                 state=excluded.state,
                 is_bug=excluded.is_bug
             """, (issue_id, owner, repo, number, author, title, created_at, closed_at, state, is_bug))
+
         page += 1
 
 def ingest_deployments_proxy(cur, owner, repo):
-    # Quick proxy: use GitHub Actions workflow runs as "deployments" if you have CD workflows.
     url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs"
     page = 1
     while True:
         params = {"per_page": 50, "page": page}
         data = gh_get(url, params=params).json()
         runs = data.get("workflow_runs") or []
+
+        print(f"[deploy] {owner}/{repo} page={page} runs={len(runs)}")
+
         if not runs:
             break
 
@@ -225,6 +276,7 @@ def ingest_deployments_proxy(cur, owner, repo):
               insert into deployments(repo_owner, repo_name, deployed_at, environment, status, source)
               values (%s,%s,%s,%s,%s,%s)
             """, (owner, repo, deployed_at, env, status, "github_actions"))
+
         page += 1
 
 def main():
@@ -239,13 +291,19 @@ def main():
         repo_meta = gh_get(f"https://api.github.com/repos/{OWNER}/{repo}").json()
         upsert_repo(cur, OWNER, repo, repo_meta.get("default_branch"))
 
-        ingest_commits(cur, OWNER, repo, since_iso=None)
-        ingest_prs(cur, OWNER, repo, state="all")
-        ingest_issues(cur, OWNER, repo)
-        ingest_deployments_proxy(cur, OWNER, repo)
+        try:
+            ingest_commits(cur, OWNER, repo, since_iso=None)
+            ingest_prs(cur, OWNER, repo, state="all")
+            ingest_issues(cur, OWNER, repo)
+            ingest_deployments_proxy(cur, OWNER, repo)
 
-        conn.commit()
-        print(f"Done: {OWNER}/{repo}")
+            conn.commit()
+            print(f"Done: {OWNER}/{repo}")
+
+        except KeyboardInterrupt:
+            print(f"\n[interrupt] Ctrl+C detected. Committing what we have for {OWNER}/{repo}...")
+            conn.commit()
+            raise
 
     cur.close()
     conn.close()
