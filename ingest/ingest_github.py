@@ -1,7 +1,7 @@
 import os
 import time
 import requests
-import psycopg2
+import psycopg
 from dateutil import parser as dt
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
@@ -28,7 +28,7 @@ def gh_get(url, params=None):
         return r
 
 def connect():
-    return psycopg2.connect(
+    return psycopg.connect(
         host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=DB_PASS
     )
 
