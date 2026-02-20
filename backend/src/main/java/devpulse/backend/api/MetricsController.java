@@ -31,104 +31,80 @@ public class MetricsController {
   // -----------------------------
   // KPI OVERVIEW (Option A)
   // -----------------------------
-  @GetMapping("/metrics/overview")
-  public Map<String, Object> overview(@RequestParam String owner, @RequestParam String repo,
-                                      @RequestParam(required=false, defaultValue="30") int days) {
-    // days is used across the KPIs so you can pick 30/90/180 in UI
-    // NOTE: ai_assisted can be null; COALESCE handles it.
-    String sql = """
-      with window as (
-        select now() - (? || ' days')::interval as start_ts
-      ),
-      pr_cycle as (
-        select avg(extract(epoch from (coalesce(merged_at, closed_at) - created_at))/3600.0) as avg_pr_cycle_hours,
-               count(*) as pr_count
-        from pull_requests, window
-        where repo_owner = ? and repo_name = ?
-          and created_at >= window.start_ts
-      ),
-      first_review as (
-        with first_review_per_pr as (
-          select repo_owner, repo_name, pr_number, min(submitted_at) as first_review_at
-          from pr_reviews, window
-          where repo_owner=? and repo_name=?
-            and submitted_at is not null
-            and submitted_at >= window.start_ts
-          group by repo_owner, repo_name, pr_number
-        )
-        select avg(extract(epoch from (fr.first_review_at - pr.created_at))/3600.0) as avg_first_review_hours
-        from pull_requests pr
-        join first_review_per_pr fr
-          on fr.repo_owner=pr.repo_owner and fr.repo_name=pr.repo_name and fr.pr_number=pr.number
-        where pr.repo_owner=? and pr.repo_name=?
-          and pr.created_at >= (select start_ts from window)
-      ),
-      ai as (
-        select
-          count(*) as total_commits,
-          sum(case when coalesce(ai_assisted,false) then 1 else 0 end) as ai_commits,
-          (sum(case when coalesce(ai_assisted,false) then 1 else 0 end)::float / nullif(count(*),0)) as ai_ratio
-        from commits, window
-        where repo_owner=? and repo_name=?
-          and committed_at >= window.start_ts
-      ),
-      bug as (
-        with weekly as (
-          select date_trunc('week', committed_at) as week, count(*) as commits
-          from commits, window
-          where repo_owner=? and repo_name=?
-            and committed_at >= window.start_ts
-          group by 1
-        ),
-        bugs as (
-          select date_trunc('week', created_at) as week, count(*) as bug_issues
-          from issues, window
-          where repo_owner=? and repo_name=? and is_bug=true
-            and created_at >= window.start_ts
-          group by 1
-        )
-        select
-          avg((coalesce(b.bug_issues,0)::float / nullif(w.commits,0)) * 100.0) as avg_bugs_per_100_commits
-        from weekly w left join bugs b on b.week=w.week
-      ),
-      dep as (
-        select count(*) as deployments
-        from deployments, window
-        where repo_owner=? and repo_name=?
-          and deployed_at >= window.start_ts
-      )
-      select
-        ? as days,
-        (select avg_pr_cycle_hours from pr_cycle) as avg_pr_cycle_hours,
-        (select pr_count from pr_cycle) as pr_count,
-        (select avg_first_review_hours from first_review) as avg_first_review_hours,
-        (select ai_ratio from ai) as ai_ratio,
-        (select total_commits from ai) as total_commits,
-        (select ai_commits from ai) as ai_commits,
-        (select avg_bugs_per_100_commits from bug) as avg_bugs_per_100_commits,
-        (select deployments from dep) as deployments,
-        ((select deployments from dep) * 7.0 / nullif(?,0)) as deployments_per_week
-    """;
+ @GetMapping("/metrics/overview")
+public Map<String, Object> overview(
+    @RequestParam String owner,
+    @RequestParam String repo,
+    @RequestParam(defaultValue = "90") int days
+) {
 
-    // days appears twice: in interval calc and deployments_per_week denominator; also returned for UI display
-    List<Map<String, Object>> rows = jdbc.queryForList(
-      sql,
-      String.valueOf(days),
-      owner, repo,
-      owner, repo,
-      owner, repo,
-      owner, repo,
-      owner, repo,
-      owner, repo,
-      owner, repo,
-      owner, repo,
-      owner, repo,
-      days,
-      days
-    );
+  String window = days + " days";
 
-    return rows.isEmpty() ? Map.of() : rows.get(0);
-  }
+  Double avgPrCycle = jdbc.queryForObject("""
+    select avg(extract(epoch from (coalesce(merged_at, closed_at) - created_at))/3600.0)
+    from pull_requests
+    where repo_owner=? and repo_name=?
+      and created_at >= now() - interval '%s'
+  """.formatted(window), Double.class, owner, repo);
+
+  Double avgReviewTime = jdbc.queryForObject("""
+    select avg(extract(epoch from (r.submitted_at - pr.created_at))/3600.0)
+    from pr_reviews r
+    join pull_requests pr
+      on r.pr_number=pr.number
+      and r.repo_owner=pr.repo_owner
+      and r.repo_name=pr.repo_name
+    where pr.repo_owner=? and pr.repo_name=?
+      and pr.created_at >= now() - interval '%s'
+  """.formatted(window), Double.class, owner, repo);
+
+  Double aiRatio = jdbc.queryForObject("""
+    select (sum(case when ai_assisted then 1 else 0 end)::float / nullif(count(*),0))
+    from commits
+    where repo_owner=? and repo_name=?
+      and committed_at >= now() - interval '%s'
+  """.formatted(window), Double.class, owner, repo);
+
+  Double bugDensity = jdbc.queryForObject("""
+    with c as (
+      select count(*) as commits
+      from commits
+      where repo_owner=? and repo_name=?
+        and committed_at >= now() - interval '%s'
+    ),
+    b as (
+      select count(*) as bugs
+      from issues
+      where repo_owner=? and repo_name=?
+        and is_bug=true
+        and created_at >= now() - interval '%s'
+    )
+    select (b.bugs::float / nullif(c.commits,0)) * 100
+    from c, b
+  """.formatted(window, window),
+    Double.class,
+    owner, repo,
+    owner, repo
+  );
+
+  Integer deployments = jdbc.queryForObject("""
+    select count(*)
+    from deployments
+    where repo_owner=? and repo_name=?
+      and deployed_at >= now() - interval '%s'
+  """.formatted(window), Integer.class, owner, repo);
+
+  // 👇 IMPORTANT: never return null values
+  return Map.of(
+    "avgPrCycleHours", avgPrCycle == null ? 0 : avgPrCycle,
+    "avgReviewHours", avgReviewTime == null ? 0 : avgReviewTime,
+    "aiRatio", aiRatio == null ? 0 : aiRatio,
+    "bugDensityPer100", bugDensity == null ? 0 : bugDensity,
+    "deployments", deployments == null ? 0 : deployments
+  );
+}
+
+
 
   // -----------------------------
   // Charts
